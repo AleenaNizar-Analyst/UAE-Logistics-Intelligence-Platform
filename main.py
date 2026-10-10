@@ -7,18 +7,8 @@ import requests
 import pandas as pd
 import numpy as np
 
-# --------------------------------------------------
-# UAE LOGISTICS INTELLIGENCE PLATFORM
-# Real route data: OpenRouteService
-# --------------------------------------------------
-
 API_KEY = os.getenv("ORS_API_KEY")
-
-API_URL = (
-    "https://api.heigit.org/openrouteservice/"
-    "v2/directions/driving-car/json"
-)
-
+API_URL = "https://api.heigit.org/openrouteservice/v2/directions/driving-car/json"
 OUTPUT_FILE = "uae_routes_cleaned.json"
 
 CITIES = {
@@ -33,15 +23,9 @@ CITIES = {
 
 
 def fetch_route(origin, destination):
-    """Fetch one real driving route with retry handling."""
-
     payload = {
-        "coordinates": [
-            CITIES[origin],
-            CITIES[destination],
-        ]
+        "coordinates": [CITIES[origin], CITIES[destination]]
     }
-
     headers = {
         "Authorization": API_KEY,
         "Content-Type": "application/json",
@@ -63,19 +47,28 @@ def fetch_route(origin, destination):
 
             response.raise_for_status()
             data = response.json()
-
             summary = data["routes"][0]["summary"]
 
             distance_m = float(summary["distance"])
             duration_s = float(summary["duration"])
 
-            if distance_m <= 0 or duration_s <= 0:
-                raise ValueError("Route returned invalid distance or duration.")
+            if (
+                not np.isfinite(distance_m)
+                or not np.isfinite(duration_s)
+                or distance_m <= 0
+                or duration_s <= 0
+            ):
+                raise ValueError("Invalid distance or duration.")
 
             return distance_m, duration_s
 
-        except (requests.RequestException, KeyError, IndexError,
-                TypeError, ValueError) as error:
+        except (
+            requests.RequestException,
+            KeyError,
+            IndexError,
+            TypeError,
+            ValueError,
+        ) as error:
             if attempt == 3:
                 raise RuntimeError(
                     f"Failed route {origin} to {destination}: {error}"
@@ -87,59 +80,51 @@ def fetch_route(origin, destination):
 def main():
     if not API_KEY:
         raise RuntimeError(
-            "ORS_API_KEY is missing. Add it under GitHub repository Secrets."
+            "ORS_API_KEY is missing from GitHub repository secrets."
         )
 
-    records = []
     retrieved_at = datetime.now(timezone.utc).isoformat()
+    snapshot_date = retrieved_at[:10]
+    records = []
 
     total_routes = len(CITIES) * (len(CITIES) - 1)
     route_number = 0
 
+    # Fetch and validate the complete daily snapshot first.
     for origin in CITIES:
         for destination in CITIES:
             if origin == destination:
                 continue
 
             route_number += 1
-
             print(
                 f"Fetching route {route_number}/{total_routes}: "
                 f"{origin} -> {destination}"
             )
 
-            distance_m, duration_s = fetch_route(
-                origin, destination
-            )
+            distance_m, duration_s = fetch_route(origin, destination)
 
             distance_km = distance_m / 1000
             duration_min = duration_s / 60
             speed_kmh = distance_km / (duration_s / 3600)
 
             records.append({
+                "snapshot_id": f"{snapshot_date}_{origin}_to_{destination}",
+                "snapshot_date": snapshot_date,
                 "route_id": f"{origin}_to_{destination}",
                 "origin": origin,
                 "destination": destination,
-                "distance_m": round(distance_m, 2),
-                "duration_s": round(duration_s, 2),
                 "distance_km": round(distance_km, 2),
                 "duration_min": round(duration_min, 2),
                 "estimated_speed_kmh": round(speed_kmh, 2),
                 "data_source": "OpenRouteService",
-                "data_type": "Real route estimate; not live traffic",
+                "data_type": "Route estimate; not live traffic",
                 "retrieved_at_utc": retrieved_at,
                 "api_status": "Success",
-                "data_quality_flag": (
-                    "Valid"
-                    if np.isfinite(distance_km)
-                    and np.isfinite(duration_min)
-                    and np.isfinite(speed_kmh)
-                    else "Check"
-                ),
+                "data_quality_flag": "Valid",
                 "duplicate_route": False,
             })
 
-            # Be considerate of the API service.
             time.sleep(1)
 
     df = pd.DataFrame(records)
@@ -150,30 +135,73 @@ def main():
         )
 
     if df["route_id"].duplicated().any():
-        raise ValueError("Duplicate route IDs detected.")
+        raise ValueError("Duplicate routes detected in today's snapshot.")
 
     if not (
         np.isfinite(df["distance_km"]).all()
         and np.isfinite(df["duration_min"]).all()
+        and np.isfinite(df["estimated_speed_kmh"]).all()
         and (df["distance_km"] > 0).all()
         and (df["duration_min"] > 0).all()
     ):
-        raise ValueError("Data validation failed.")
+        raise ValueError("Daily snapshot validation failed.")
+
+    # Load existing history, keeping older records.
+    history = []
+
+    if os.path.exists(OUTPUT_FILE):
+        with open(OUTPUT_FILE, "r", encoding="utf-8") as file:
+            history = json.load(file)
+
+        if not isinstance(history, list):
+            raise ValueError("Existing JSON must contain a list of records.")
+
+    # Preserve older records and identify their snapshot dates.
+    for record in history:
+        if not record.get("snapshot_date"):
+            old_timestamp = record.get("retrieved_at_utc", "")
+            if len(old_timestamp) >= 10:
+                record["snapshot_date"] = old_timestamp[:10]
+            else:
+                raise ValueError(
+                    "An old record has no usable snapshot date."
+                )
+
+        if not record.get("snapshot_id"):
+            record["snapshot_id"] = (
+                f"{record['snapshot_date']}_{record['route_id']}"
+            )
+
+    # Replace today's snapshot if this workflow runs again today.
+    # Keep every other date unchanged.
+    history = [
+        record for record in history
+        if record.get("snapshot_date") != snapshot_date
+    ]
+
+    combined = history + records
+    combined_df = pd.DataFrame(combined)
+
+    if combined_df["snapshot_id"].duplicated().any():
+        raise ValueError("Duplicate snapshot IDs detected in history.")
+
+    combined.sort(
+        key=lambda record: (
+            record["snapshot_date"],
+            record["route_id"],
+        )
+    )
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as file:
-        json.dump(
-            records,
-            file,
-            indent=2,
-            ensure_ascii=False,
-        )
+        json.dump(combined, file, indent=2, ensure_ascii=False)
 
-    print("\nRoute refresh completed successfully.")
-    print(f"Total routes: {len(df)}")
-    print(f"Successful API records: {(df['api_status'] == 'Success').sum()}")
+    print("\nDaily route snapshot saved successfully.")
+    print(f"Today's routes: {len(records)}")
+    print(f"Historical records: {len(combined)}")
+    print(f"Snapshot date (UTC): {snapshot_date}")
     print(f"Average route distance: {df['distance_km'].mean():.2f} km")
     print(f"Average estimated duration: {df['duration_min'].mean():.2f} min")
-    print(f"Output saved to: {OUTPUT_FILE}")
+    print(f"Output file: {OUTPUT_FILE}")
 
 
 if __name__ == "__main__":
